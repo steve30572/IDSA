@@ -3,70 +3,6 @@ import torch.nn as nn
 
 
 
-class Chomp1d(nn.Module):
-    def __init__(self, chomp_size):
-        super(Chomp1d, self).__init__()
-        self.chomp_size = chomp_size
-
-    def forward(self, x):
-        return x[:, :, :-self.chomp_size].contiguous()
-
-
-class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
-        super(TemporalBlock, self).__init__()
-        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation)
-        self.chomp1 = Chomp1d(padding)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation)
-        self.chomp2 = Chomp1d(padding)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
-                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.relu = nn.ReLU()
-        self.init_weights()
-
-    def init_weights(self):
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv2.weight.data.normal_(0, 0.01)
-        if self.downsample is not None:
-            self.downsample.weight.data.normal_(0, 0.01)
-
-    def forward(self, x):
-        out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
-
-class TCN(nn.Module):
-    def __init__(self, input_size, dilation_factor, num_channels, kernel_size=7, dropout=0.2):
-        super(TCN, self).__init__()
-        # self.tcn = TemporalBlock(input_size, num_channels, kernel_size, dropout)
-        layers = []
-        num_levels = len(num_channels)
-        dilation_factor = dilation_factor
-        for i in range(num_levels):
-            dilation_size = dilation_factor ** i
-            in_channels = input_size if i == 0 else num_channels[i-1]
-            out_channels = num_channels[i]
-            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
-                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
-        self.tcn = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # x shape: (B, T, C)
-        x = x.permute(0, 2, 1)  # (B, C, T)
-        y1 = self.tcn(x)  # (B, D, T)
-        y1 = y1.permute(0, 2, 1)  # (B, T, D)
-        return y1
-
-
 class Spatial_MHA(nn.Module):
     def __init__(self, input_size):
         super(Spatial_MHA, self).__init__()
@@ -132,37 +68,38 @@ class Classifier(nn.Module):
         self.linear1 = nn.Linear(input_size, hidden_size)
         self.linear2 = nn.Linear(hidden_size, num_classes)
         self.drop = nn.Dropout(0.5)
-        self.batch_norm = nn.BatchNorm1d(hidden_size)
         
     def forward(self, x):
         out = self.linear1(x)
-        out = self.batch_norm(out)
         out = nn.functional.relu(out)
         out = self.drop(out)
         out = self.linear2(out)
         return out
     
 class IDSA(nn.Module):
-    def __init__(self, input_feat_dim, hidden_size, num_layers, num_classes, channel_num, spa_mode='mha', temp_mode='lstm', dilation_factor=3):
+    def __init__(self, input_feat_dim, hidden_size, num_layers, num_classes, channel_num, mode='mha'):
         super(IDSA, self).__init__()
-        if spa_mode == 'mha':
+        if mode == 'mha':
             self.spatial_layer = Spatial_MHA(input_feat_dim)
         else:
             self.spatial_layer = Spatial_Linear(input_feat_dim, input_feat_dim)
-        if temp_mode == 'lstm':
-            self.temporal_layer = LSTM(channel_num, hidden_size, num_layers)
-        else:
-            self.temporal_layer = TCN(channel_num, dilation_factor, [hidden_size]*num_layers)
+        self.temporal_layer = LSTM(channel_num, hidden_size, num_layers)
         self.classifier = Classifier(hidden_size, hidden_size, num_classes)
 
         self.source_embed = nn.Embedding(channel_num, input_feat_dim)
         self.target_embed = nn.Embedding(channel_num, input_feat_dim)
         self.mapping_matrix = nn.Parameter(torch.randn(channel_num, channel_num))
+        self.transform_layer = nn.Linear(input_feat_dim, input_feat_dim, bias=True)
+        nn.init.eye_(self.transform_layer.weight)
 
 
     def EMA(self, alpha=0.9):
         self.target_embed.weight.data = alpha * self.target_embed.weight.data + (1-alpha) * self.source_embed.weight.data   
-
+    
+    def Position_transform(self, alpha = 0.9):
+        transformed_embed =  self.transform_layer(self.source_embed.weight)
+        self.target_embed.weight.data = transformed_embed.data
+        
     def EMA_map(self, alpha=0.9):
         mapped_source = torch.matmul(self.mapping_matrix, self.source_embed.weight.data)
         self.target_embed.weight.data = alpha * self.target_embed.weight.data + (1-alpha) * mapped_source
@@ -190,9 +127,6 @@ class IDSA(nn.Module):
             x = x + self.source_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         out = self.spatial_layer(x, residual=True)
         
-        # checking only temporal layer (no spatial layer)
-        # out = x
-
         # Reshape for temporal processing
         out = out.permute(0, 2, 1)
         
@@ -242,7 +176,7 @@ class Inter_domain_loss(nn.Module):
                 distance_matrix[i,j] = dist_element
         distance_matrix = distance_matrix.to(mean_src.device)
         graph = self.doubly_stochastic(graph)
-        # graph = self.marginalization(graph, source_embed_w, target_embed_w)
+        #graph = self.marginalization(graph, source_embed_w, target_embed_w)
         ### compute the loss
         loss = torch.sum(torch.mul(distance_matrix, graph))
         return loss
