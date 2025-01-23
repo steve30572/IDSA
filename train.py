@@ -30,6 +30,7 @@ parser.add_argument('--pseudo', type=float, default=0., help='weight value for c
 parser.add_argument("--warmup", nargs="?", default=50, type=int, help="Warmup epochs before applying pseudo labeling loss ")
 parser.add_argument('--permutation', type= bool, default= False, help='for permutation experiment')
 parser.add_argument('--permutation_info', type= list, default= [2, 5], help='the sensor index that switched')
+parser.add_argument('--ema', type= bool, default= True, help='apply EMA when updating target')
 
 
 args = parser.parse_args()
@@ -136,7 +137,8 @@ for epoch in range(args.epoch):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        model.EMA(alpha=0.9)
+        if args.ema:
+            model.EMA(alpha=0.9)
         
     model.eval()
     with torch.no_grad():
